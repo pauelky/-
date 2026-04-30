@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import os
 import hashlib
 import hmac
 import json
@@ -10,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header
 from pydantic import BaseModel
 
 
@@ -21,7 +22,15 @@ APP_NAME = "malinovka"
 
 # ВАЖНО: поменяй на свой секрет.
 # Этот же секрет потом надо вставить в программу.
-SECRET_KEY = "167f7202d3c4de2ee1b4268517afcd7da7a77ff1724ae2dd7ca545254126ba9f"
+SECRET_KEY = os.environ.get(
+    "SECRET_KEY",
+    "167f7202d3c4de2ee1b4268517afcd7da7a77ff1724ae2dd7ca545254126ba9f",
+)
+
+ADMIN_KEY = os.environ.get(
+    "ADMIN_KEY",
+    "b2cff99483b2a9ee076091e74d83d9f072f6d374e1fd577b11d288e3c0a86db5",
+)
 
 app = FastAPI()
 
@@ -168,6 +177,42 @@ def index():
         "ok": True,
         "app": APP_NAME,
         "message": "Malinovka activation server is running",
+    }
+
+@app.post("/admin/import-keys")
+def admin_import_keys(x_admin_key: str = Header(default="")):
+    if x_admin_key != ADMIN_KEY:
+        return {"ok": False, "error": "Forbidden"}
+
+    import_keys()
+    return {"ok": True, "message": "Keys imported"}
+
+
+@app.get("/admin/stats")
+def admin_stats(x_admin_key: str = Header(default="")):
+    if x_admin_key != ADMIN_KEY:
+        return {"ok": False, "error": "Forbidden"}
+
+    init_db()
+
+    with db() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM activation_codes"
+        ).fetchone()[0]
+
+        unused = conn.execute(
+            "SELECT COUNT(*) FROM activation_codes WHERE used = 0"
+        ).fetchone()[0]
+
+        used = conn.execute(
+            "SELECT COUNT(*) FROM activation_codes WHERE used = 1"
+        ).fetchone()[0]
+
+    return {
+        "ok": True,
+        "total": total,
+        "unused": unused,
+        "used": used,
     }
 
 
