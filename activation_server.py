@@ -1,27 +1,27 @@
 from __future__ import annotations
 
 import base64
-import os
 import hashlib
 import hmac
 import json
+import os
 import secrets
-import sqlite3
 import sys
 import time
 from pathlib import Path
 
+import psycopg
+from psycopg.rows import dict_row
 from fastapi import FastAPI, Header
 from pydantic import BaseModel
 
 
-DB_PATH = Path("activation.db")
 KEYS_PATH = Path("keys_for_distribution.txt")
 
 APP_NAME = "malinovka"
 
-# ВАЖНО: поменяй на свой секрет.
-# Этот же секрет потом надо вставить в программу.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
 SECRET_KEY = os.environ.get(
     "SECRET_KEY",
     "167f7202d3c4de2ee1b4268517afcd7da7a77ff1724ae2dd7ca545254126ba9f",
@@ -41,33 +41,44 @@ class ActivateRequest(BaseModel):
     app: str
 
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def db():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set")
+
+    return psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+    )
 
 
 def init_db() -> None:
     with db() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS activation_codes (
-                code TEXT PRIMARY KEY,
-                app TEXT NOT NULL,
-                used INTEGER NOT NULL DEFAULT 0,
-                used_at INTEGER NULL,
-                machine_id TEXT NULL
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS activation_codes (
+                    code TEXT PRIMARY KEY,
+                    app TEXT NOT NULL,
+                    used INTEGER NOT NULL DEFAULT 0,
+                    used_at BIGINT NULL,
+                    machine_id TEXT NULL
+                )
+                """
             )
-            """
-        )
+            conn.commit()
 
 
-def import_keys() -> None:
+def import_keys() -> dict:
     init_db()
 
     if not KEYS_PATH.exists():
-        print(f"Файл с ключами не найден: {KEYS_PATH}")
-        return
+        return {
+            "ok": False,
+            "error": f"Файл с ключами не найден: {KEYS_PATH}",
+            "total_in_file": 0,
+            "added": 0,
+            "skipped": 0,
+        }
 
     lines = KEYS_PATH.read_text(encoding="utf-8").splitlines()
 
@@ -81,40 +92,45 @@ def import_keys() -> None:
     skipped = 0
 
     with db() as conn:
-        for code in keys:
-            try:
-                conn.execute(
+        with conn.cursor() as cur:
+            for code in keys:
+                cur.execute(
                     """
                     INSERT INTO activation_codes (code, app, used)
-                    VALUES (?, ?, 0)
+                    VALUES (%s, %s, 0)
+                    ON CONFLICT (code) DO NOTHING
                     """,
                     (code, APP_NAME),
                 )
-                added += 1
-            except sqlite3.IntegrityError:
-                skipped += 1
 
-    print("Импорт готов.")
-    print(f"Ключей в файле: {len(keys)}")
-    print(f"Добавлено новых: {added}")
-    print(f"Пропущено дублей: {skipped}")
+                if cur.rowcount == 1:
+                    added += 1
+                else:
+                    skipped += 1
+
+            conn.commit()
+
+    return {
+        "ok": True,
+        "total_in_file": len(keys),
+        "added": added,
+        "skipped": skipped,
+    }
 
 
 def print_stats() -> None:
     init_db()
 
     with db() as conn:
-        total = conn.execute(
-            "SELECT COUNT(*) FROM activation_codes"
-        ).fetchone()[0]
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS count FROM activation_codes")
+            total = cur.fetchone()["count"]
 
-        unused = conn.execute(
-            "SELECT COUNT(*) FROM activation_codes WHERE used = 0"
-        ).fetchone()[0]
+            cur.execute("SELECT COUNT(*) AS count FROM activation_codes WHERE used = 0")
+            unused = cur.fetchone()["count"]
 
-        used = conn.execute(
-            "SELECT COUNT(*) FROM activation_codes WHERE used = 1"
-        ).fetchone()[0]
+            cur.execute("SELECT COUNT(*) AS count FROM activation_codes WHERE used = 1")
+            used = cur.fetchone()["count"]
 
     print(f"Всего ключей: {total}")
     print(f"Свободных ключей: {unused}")
@@ -127,13 +143,16 @@ def create_random_code() -> None:
     code = secrets.token_urlsafe(64)
 
     with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO activation_codes (code, app, used)
-            VALUES (?, ?, 0)
-            """,
-            (code, APP_NAME),
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO activation_codes (code, app, used)
+                VALUES (%s, %s, 0)
+                ON CONFLICT (code) DO NOTHING
+                """,
+                (code, APP_NAME),
+            )
+            conn.commit()
 
     print("Создан новый ключ:")
     print(code)
@@ -176,16 +195,17 @@ def index():
     return {
         "ok": True,
         "app": APP_NAME,
+        "database": "postgresql",
         "message": "Malinovka activation server is running",
     }
+
 
 @app.post("/admin/import-keys")
 def admin_import_keys(x_admin_key: str = Header(default="")):
     if x_admin_key != ADMIN_KEY:
         return {"ok": False, "error": "Forbidden"}
 
-    import_keys()
-    return {"ok": True, "message": "Keys imported"}
+    return import_keys()
 
 
 @app.get("/admin/stats")
@@ -196,17 +216,15 @@ def admin_stats(x_admin_key: str = Header(default="")):
     init_db()
 
     with db() as conn:
-        total = conn.execute(
-            "SELECT COUNT(*) FROM activation_codes"
-        ).fetchone()[0]
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS count FROM activation_codes")
+            total = cur.fetchone()["count"]
 
-        unused = conn.execute(
-            "SELECT COUNT(*) FROM activation_codes WHERE used = 0"
-        ).fetchone()[0]
+            cur.execute("SELECT COUNT(*) AS count FROM activation_codes WHERE used = 0")
+            unused = cur.fetchone()["count"]
 
-        used = conn.execute(
-            "SELECT COUNT(*) FROM activation_codes WHERE used = 1"
-        ).fetchone()[0]
+            cur.execute("SELECT COUNT(*) AS count FROM activation_codes WHERE used = 1")
+            used = cur.fetchone()["count"]
 
     return {
         "ok": True,
@@ -242,35 +260,38 @@ def activate(req: ActivateRequest):
         }
 
     with db() as conn:
-        row = conn.execute(
-            """
-            SELECT *
-            FROM activation_codes
-            WHERE code = ? AND app = ?
-            """,
-            (code, APP_NAME),
-        ).fetchone()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM activation_codes
+                WHERE code = %s AND app = %s
+                """,
+                (code, APP_NAME),
+            )
+            row = cur.fetchone()
 
-        if row is None:
-            return {
-                "ok": False,
-                "error": "Неверный ключ",
-            }
+            if row is None:
+                return {
+                    "ok": False,
+                    "error": "Неверный ключ",
+                }
 
-        if row["used"]:
-            return {
-                "ok": False,
-                "error": "Ключ уже использован",
-            }
+            if row["used"]:
+                return {
+                    "ok": False,
+                    "error": "Ключ уже использован",
+                }
 
-        conn.execute(
-            """
-            UPDATE activation_codes
-            SET used = 1, used_at = ?, machine_id = ?
-            WHERE code = ? AND app = ?
-            """,
-            (int(time.time()), machine_id, code, APP_NAME),
-        )
+            cur.execute(
+                """
+                UPDATE activation_codes
+                SET used = 1, used_at = %s, machine_id = %s
+                WHERE code = %s AND app = %s
+                """,
+                (int(time.time()), machine_id, code, APP_NAME),
+            )
+            conn.commit()
 
     license_token = create_license_token(machine_id, code)
 
@@ -298,7 +319,8 @@ if __name__ == "__main__":
     command = sys.argv[1].lower().strip()
 
     if command == "import":
-        import_keys()
+        result = import_keys()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
     elif command == "stats":
         print_stats()
     elif command == "create":
